@@ -18,7 +18,7 @@ from django.utils.module_loading import import_string
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.http import require_POST
 
-from .forms import ConfirmImportForm, ExportForm, ImportForm
+from .forms import ConfirmImportForm, ImportForm, SelectableFieldsExportForm
 from .mixins import BaseExportMixin, BaseImportMixin
 from .results import RowResult
 from .signals import post_export, post_import
@@ -83,6 +83,10 @@ class ImportMixin(BaseImportMixin, ImportExportMixinBase):
     confirm_form_class = ConfirmImportForm
     #: import data encoding
     from_encoding = "utf-8-sig"
+    #: control which UI elements appear when import errors are displayed.
+    #: Available options: 'message', 'row', 'traceback'
+    import_error_display = ("message",)
+
     skip_admin_log = None
     # storage class for saving temporary files
     tmp_storage_class = None
@@ -535,6 +539,7 @@ class ImportMixin(BaseImportMixin, ImportExportMixinBase):
             )
             for resource in resources
         ]
+        context["import_error_display"] = self.import_error_display
 
         request.current_app = self.admin_site.name
         return TemplateResponse(request, [self.import_template_name], context)
@@ -581,8 +586,8 @@ class ExportMixin(BaseExportMixin, ImportExportMixinBase):
     """
     Export mixin.
 
-    This is intended to be mixed with django.contrib.admin.ModelAdmin
-    https://docs.djangoproject.com/en/dev/ref/contrib/admin/
+    This is intended to be mixed with
+    `ModelAdmin <https://docs.djangoproject.com/en/stable/ref/contrib/admin/>`_.
     """
 
     #: template for change_list view
@@ -591,8 +596,10 @@ class ExportMixin(BaseExportMixin, ImportExportMixinBase):
     export_template_name = "admin/import_export/export.html"
     #: export data encoding
     to_encoding = None
-    #: form class to use for the initial import step
-    export_form_class = ExportForm
+    #: Form class to use for the initial export step.
+    #: Assign to :class:`~import_export.forms.ExportForm` if you would
+    #: like to disable selectable fields feature.
+    export_form_class = SelectableFieldsExportForm
 
     def get_urls(self):
         urls = super().get_urls()
@@ -651,8 +658,25 @@ class ExportMixin(BaseExportMixin, ImportExportMixinBase):
         }
         if django.VERSION >= (4, 0):
             changelist_kwargs["search_help_text"] = self.search_help_text
-        cl = ChangeList(**changelist_kwargs)
 
+        class ExportChangeList(ChangeList):
+            def get_results(self, request):
+                """
+                Overrides ChangeList.get_results() to bypass default operations like
+                pagination and result counting, which are not needed for export. This
+                prevents executing unnecessary COUNT queries during ChangeList
+                initialization.
+                """
+                pass
+
+        cl = ExportChangeList(**changelist_kwargs)
+
+        # get_queryset() is already called during initialization,
+        # it is enough to get its results
+        if hasattr(cl, "queryset"):
+            return cl.queryset
+
+        # Fallback in case the ChangeList doesn't have queryset attribute set
         return cl.get_queryset(request)
 
     def get_export_data(self, file_format, queryset, *args, **kwargs):
@@ -754,7 +778,9 @@ class ExportMixin(BaseExportMixin, ImportExportMixinBase):
                 res.get_display_name(),
                 [
                     field.column_name
-                    for field in res(model=self.model).get_user_visible_fields()
+                    for field in res(
+                        **self.get_export_resource_kwargs(request)
+                    ).get_user_visible_fields()
                 ],
             )
             for res in self.get_export_resource_classes()

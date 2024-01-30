@@ -1,14 +1,24 @@
 Changelog
 =========
 
-Please refer to :doc:`release notes<release_notes>`.
+.. warning::
+
+    Version 4 introduces breaking changes.  Please refer to :doc:`release notes<release_notes>`.
 
 4.0.0-beta.3 (unreleased)
 -------------------------
 
+- Added feature: selectable fields for admin export view (#1734)
 - Fix issue where declared Resource fields not defined in ``fields`` are still imported (#1702)
 - Added customizable ``MediaStorage`` (#1708)
 - Relocated admin integration section from advanced_usage.rst into new file (#1713)
+- Fix slow export with ForeignKey id (#1717)
+- Added customization of Admin UI import error messages (#1727)
+- Improve output of error messages (#1729)
+- Refactor `test_resources.py` into smaller modules (#1733)
+- Added specific check for declared :attr:`~import_export.options.ResourceOptions.import_id_fields` not in dataset
+  (#1735)
+- Updated Admin integration documentation to clarify how to save custom form values (#1746)
 
 4.0.0-beta.2 (2023-12-09)
 -------------------------
@@ -18,7 +28,7 @@ Please refer to :doc:`release notes<release_notes>`.
 - Support export from model change form (#1687)
 - Updated Admin UI to track deleted and skipped Imports (#1691)
 - Import form defaults to read-only field if only one format defined (#1690)
-- Refactored :module:`~import_export.resources` into separate modules for ``declarative`` and ``options`` (#1695)
+- Refactored :mod:`~import_export.resources` into separate modules for ``declarative`` and ``options`` (#1695)
 - fix multiple inheritance not setting options (#1696)
 - Refactored tests to remove dependencies between tests (#1703)
 - Handle python3.12 datetime deprecations (#1705)
@@ -74,6 +84,25 @@ Documentation
 
 - Clarified ``skip_diff`` documentation (#1655)
 - Improved documentation relating to validation on import (#1665)
+
+3.3.7 (unreleased)
+------------------
+
+- Pass :meth:`~import_export.mixins.BaseExportMixin.get_export_resource_kwargs` to Resource constructor
+  :meth:`~import_export.admin.ExportMixin.export_action` (#1739)
+- Fix issue with model class passed to Resource constructor crashing on export (#1745)
+
+3.3.6 (2024-01-10)
+------------------
+
+- Fix issue with highlight when using 'light' color scheme (#1728)
+
+3.3.5 (2023-12-19)
+------------------
+
+- Remove unnecessary ChangeList queries to speed up export via Admin UI (#1715)
+- Respect color scheme override (#1720)
+- Update FAQ to cover skipping rows with validation errors (#1721)
 
 3.3.4 (2023-12-09)
 ------------------

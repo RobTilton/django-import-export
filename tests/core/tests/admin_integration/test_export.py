@@ -1,17 +1,22 @@
 from datetime import datetime
 from io import BytesIO
 from unittest import mock
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import chardet
 import tablib
+from core.admin import BookAdmin, BookResource
 from core.models import Author, Book
 from core.tests.admin_integration.mixins import AdminTestMixin
 from core.tests.utils import (
     ignore_utcnow_deprecation_warning,
     ignore_widget_deprecation_warning,
 )
+from django.contrib.admin.sites import AdminSite
+from django.contrib.admin.views.main import ChangeList
+from django.contrib.auth.models import User
 from django.http import HttpRequest
+from django.test import RequestFactory
 from django.test.testcases import TestCase
 from django.test.utils import override_settings
 from openpyxl.reader.excel import load_workbook
@@ -23,6 +28,15 @@ from import_export.formats.base_formats import XLSX
 
 
 class ExportAdminIntegrationTest(AdminTestMixin, TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.bookresource_export_fields_payload = {
+            "bookresource_id": True,
+            "bookresource_name": True,
+            "bookresource_author_email": True,
+            "bookresource_categories": True,
+        }
+
     def test_export(self):
         response = self.client.get("/admin/core/book/export/")
         self.assertEqual(response.status_code, 200)
@@ -30,11 +44,11 @@ class ExportAdminIntegrationTest(AdminTestMixin, TestCase):
         form = response.context["form"]
         self.assertEqual(2, len(form.fields["resource"].choices))
 
-        data = {
-            "format": "0",
-        }
+        data = {"format": "0", **self.bookresource_export_fields_payload}
         date_str = datetime.now().strftime("%Y-%m-%d")
-        response = self.client.post("/admin/core/book/export/", data)
+        # Should not contain COUNT queries from ModelAdmin.get_results()
+        with self.assertNumQueries(6):
+            response = self.client.post("/admin/core/book/export/", data)
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.has_header("Content-Disposition"))
         self.assertEqual(response["Content-Type"], "text/csv")
@@ -43,10 +57,97 @@ class ExportAdminIntegrationTest(AdminTestMixin, TestCase):
             'attachment; filename="Book-{}.csv"'.format(date_str),
         )
         self.assertEqual(
-            b"id,name,author,author_email,imported,published,"
-            b"published_time,price,added,categories\r\n",
+            b"id,name,author_email,categories\r\n",
             response.content,
         )
+
+    @mock.patch("core.admin.BookAdmin.get_export_resource_kwargs")
+    def test_export_passes_export_resource_kwargs(
+        self, mock_get_export_resource_kwargs
+    ):
+        # issue 1738
+        mock_get_export_resource_kwargs.return_value = {"a": 1}
+        response = self.client.get("/admin/core/book/export/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(2, mock_get_export_resource_kwargs.call_count)
+
+    def book_resource_init(self):
+        # stub call to the resource constructor
+        pass
+
+    @mock.patch.object(BookResource, "__init__", book_resource_init)
+    def test_export_passes_no_resource_constructor_params(self):
+        # issue 1716
+        # assert that the export call with a no-arg constructor
+        # does not crash
+        response = self.client.get("/admin/core/book/export/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_get_export_queryset(self):
+        model_admin = BookAdmin(Book, AdminSite())
+
+        factory = RequestFactory()
+        request = factory.get("/admin/core/book/export/")
+        request.user = User.objects.create_user("admin1")
+
+        call_number = 0
+
+        class MyChangeList(ChangeList):
+            def get_queryset(self, request):
+                nonlocal call_number
+                call_number += 1
+                return super().get_queryset(request)
+
+        model_admin.get_changelist = lambda request: MyChangeList
+
+        with patch.object(model_admin, "get_paginator") as mock_get_paginator:
+            with self.assertNumQueries(4):
+                queryset = model_admin.get_export_queryset(request)
+
+            mock_get_paginator.assert_not_called()
+            self.assertEqual(call_number, 1)
+
+        self.assertEqual(queryset.count(), Book.objects.count())
+
+    def test_get_export_queryset_no_queryset_init(self):
+        """Test if user has own ChangeList which doesn't store queryset during init"""
+        model_admin = BookAdmin(Book, AdminSite())
+
+        factory = RequestFactory()
+        request = factory.get("/admin/core/book/export/")
+        request.user = User.objects.create_user("admin1")
+
+        call_number = 0
+
+        class MyChangeList(ChangeList):
+            def __init__(self, *args, **kwargs):
+                self.filter_params = {}
+                self.model_admin = kwargs.pop("model_admin")
+                self.list_filter = kwargs.pop("list_filter")
+                self.model = kwargs.pop("model")
+                self.date_hierarchy = kwargs.pop("date_hierarchy")
+                self.root_queryset = self.model_admin.get_queryset(request)
+                self.list_select_related = kwargs.pop("list_select_related")
+                self.list_display = kwargs.pop("list_display")
+                self.lookup_opts = self.model._meta
+                self.params = {}
+                self.query = ""
+
+            def get_queryset(self, request):
+                nonlocal call_number
+                call_number += 1
+                return super().get_queryset(request)
+
+        model_admin.get_changelist = lambda request: MyChangeList
+
+        with patch.object(model_admin, "get_paginator") as mock_get_paginator:
+            with self.assertNumQueries(4):
+                queryset = model_admin.get_export_queryset(request)
+
+            mock_get_paginator.assert_not_called()
+            self.assertEqual(call_number, 1)
+
+        self.assertEqual(queryset.count(), Book.objects.count())
 
     def test_get_export_form_single_resource(self):
         response = self.client.get("/admin/core/category/export/")
@@ -66,6 +167,9 @@ class ExportAdminIntegrationTest(AdminTestMixin, TestCase):
         data = {
             "format": "0",
             "resource": 1,
+            # Second resource is `BookNameResource`
+            "booknameresource_id": True,
+            "booknameresource_name": True,
         }
         date_str = datetime.now().strftime("%Y-%m-%d")
         response = self.client.post("/admin/core/book/export/", data)
@@ -122,7 +226,7 @@ class ExportAdminIntegrationTest(AdminTestMixin, TestCase):
         self.assertEqual(response.status_code, 200)
 
         xlsx_index = self._get_input_format_index("xlsx")
-        data = {"format": str(xlsx_index)}
+        data = {"format": str(xlsx_index), **self.bookresource_export_fields_payload}
         response = self.client.post("/admin/core/book/export/", data)
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.has_header("Content-Disposition"))
@@ -141,7 +245,7 @@ class ExportAdminIntegrationTest(AdminTestMixin, TestCase):
         self.assertEqual(response.status_code, 200)
 
         xlsx_index = self._get_input_format_index("xlsx")
-        data = {"format": str(xlsx_index)}
+        data = {"format": str(xlsx_index), **self.bookresource_export_fields_payload}
         response = self.client.post("/admin/core/book/export/", data)
         self.assertEqual(response.status_code, 200)
         content = response.content
@@ -157,10 +261,14 @@ class ExportAdminIntegrationTest(AdminTestMixin, TestCase):
         self.assertEqual(response.status_code, 200)
 
         index = self._get_input_format_index("csv")
-        data = {"format": str(index)}
+        data = {
+            "format": str(index),
+            "bookresource_id": True,
+            "bookresource_name": True,
+        }
         response = self.client.post("/admin/core/book/export/", data)
         self.assertIn(
-            f"{b1.id},SUM(1+1),,,0,,,,,\r\n".encode(),
+            f"{b1.id},SUM(1+1)\r\n".encode(),
             response.content,
         )
 
@@ -172,10 +280,14 @@ class ExportAdminIntegrationTest(AdminTestMixin, TestCase):
         self.assertEqual(response.status_code, 200)
 
         index = self._get_input_format_index("csv")
-        data = {"format": str(index)}
+        data = {
+            "format": str(index),
+            "bookresource_id": True,
+            "bookresource_name": True,
+        }
         response = self.client.post("/admin/core/book/export/", data)
         self.assertIn(
-            f"{b1.id},=SUM(1+1),,,0,,,,,\r\n".encode(),
+            f"{b1.id},=SUM(1+1)\r\n".encode(),
             response.content,
         )
 
@@ -209,7 +321,7 @@ class FilteredExportAdminIntegrationTest(AdminTestMixin, TestCase):
 
 class TestExportEncoding(TestCase):
     mock_request = MagicMock(spec=HttpRequest)
-    mock_request.POST = {"format": 0}
+    mock_request.POST = {"format": 0, "bookresource_id": True}
 
     class TestMixin(ExportMixin):
         model = Book
@@ -291,3 +403,19 @@ class TestExportEncoding(TestCase):
             self.export_mixin.export_admin_action(self.mock_request, list())
             encoding_kwarg = mock_get_export_data.call_args_list[0][1]["encoding"]
             self.assertEqual("utf-8", encoding_kwarg)
+
+
+class TestSelectableFieldsExportPage(AdminTestMixin, TestCase):
+    def test_selectable_fields_rendered_with_resource_index_attribute(self) -> None:
+        response = self.client.get("/admin/core/book/export/")
+
+        self.assertEqual(response.status_code, 200)
+        form_resources = response.context["form"].resources
+        response_content = str(response.content)
+
+        for index, resource in enumerate(form_resources):
+            resource_fields = resource().get_export_order()
+            self.assertEqual(
+                response_content.count(f'resource-index="{index}"'),
+                len(resource_fields),
+            )

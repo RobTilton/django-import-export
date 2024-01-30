@@ -4,6 +4,7 @@ import traceback
 from collections import OrderedDict
 from copy import deepcopy
 from html import escape
+from warnings import warn
 
 import tablib
 from diff_match_patch import diff_match_patch
@@ -13,15 +14,15 @@ from django.core.management.color import no_style
 from django.core.paginator import Paginator
 from django.db import connections, router
 from django.db.models import fields
+from django.db.models.fields.related import ForeignKey
 from django.db.models.query import QuerySet
 from django.db.transaction import TransactionManagementError, set_rollback
 from django.utils.encoding import force_str
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 
-from . import widgets
+from . import exceptions, widgets
 from .declarative import DeclarativeMetaclass, ModelDeclarativeMetaclass
-from .exceptions import FieldError
 from .fields import Field
 from .results import Error, Result, RowResult
 from .utils import atomic_if_using_transaction, get_related_model
@@ -422,6 +423,18 @@ class Resource(metaclass=DeclarativeMetaclass):
     def get_import_fields(self):
         return [self.fields[f] for f in self.get_import_order()]
 
+    def import_obj(self, obj, data, dry_run, **kwargs):
+        warn(
+            "The 'import_obj' method is deprecated and will be replaced "
+            "with 'import_instance(self, instance, row, **kwargs)' "
+            "in a future release.  Refer to Release Notes for details.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if dry_run is True:
+            kwargs.update({"dry_run": dry_run})
+        self.import_instance(obj, data, **kwargs)
+
     def import_instance(self, instance, row, **kwargs):
         r"""
         Traverses every field in this Resource and calls
@@ -614,6 +627,18 @@ class Resource(metaclass=DeclarativeMetaclass):
         """
         pass
 
+    def after_import_instance(self, instance, new, row_number=None, **kwargs):
+        warn(
+            "The 'after_import_instance' method is deprecated and will be replaced "
+            "with 'after_init_instance(self, instance, new, row, **kwargs)' "
+            "in a future release.  Refer to Release Notes for details.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if row_number is not None:
+            kwargs.update({"row_number": row_number})
+        self.after_init_instance(instance, new, None, **kwargs)
+
     def after_init_instance(self, instance, new, row, **kwargs):
         r"""
         Override to add additional logic. Does nothing by default.
@@ -633,9 +658,11 @@ class Resource(metaclass=DeclarativeMetaclass):
         logger.debug(error, exc_info=error)
         if result:
             tb_info = traceback.format_exc()
-            result.append_base_error(self.get_error_result_class()(error, tb_info))
+            result.append_base_error(
+                self.get_error_result_class()(error, traceback=tb_info)
+            )
         if raise_errors:
-            raise
+            raise exceptions.ImportError(error)
 
     def import_row(self, row, instance_loader, **kwargs):
         r"""
@@ -736,7 +763,11 @@ class Resource(metaclass=DeclarativeMetaclass):
             if not isinstance(e, TransactionManagementError):
                 logger.debug(e, exc_info=e)
             tb_info = traceback.format_exc()
-            row_result.errors.append(self.get_error_result_class()(e, tb_info, row))
+            row_result.errors.append(
+                self.get_error_result_class()(
+                    e, traceback=tb_info, row=row, number=kwargs["row_number"]
+                )
+            )
 
         return row_result
 
@@ -762,8 +793,12 @@ class Resource(metaclass=DeclarativeMetaclass):
         :param use_transactions: If ``True`` the import process will be processed
             inside a transaction.
 
-        :param collect_failed_rows: If ``True`` the import process will collect
-            failed rows.
+        :param collect_failed_rows:
+          If ``True`` the import process will create a new dataset object comprising
+          failed rows and errors.
+          This can be useful for debugging purposes but will cause higher memory usage
+          for larger datasets.
+          See :attr:`~import_export.results.Result.failed_dataset`.
 
         :param rollback_on_validation_errors: If both ``use_transactions`` and
           ``rollback_on_validation_errors`` are set to ``True``, the import process will
@@ -895,16 +930,21 @@ class Resource(metaclass=DeclarativeMetaclass):
             result.increment_row_result_total(row_result)
 
             if row_result.errors:
+                result.append_error_row(i, row, row_result.errors)
                 if collect_failed_rows:
                     result.append_failed_row(row, row_result.errors[0])
                 if raise_errors:
-                    raise row_result.errors[-1].error
+                    raise exceptions.ImportError(
+                        row_result.errors[-1].error, number=i, row=row
+                    )
             elif row_result.validation_error:
                 result.append_invalid_row(i, row, row_result.validation_error)
                 if collect_failed_rows:
                     result.append_failed_row(row, row_result.validation_error)
                 if raise_errors:
-                    raise row_result.validation_error
+                    raise exceptions.ImportError(
+                        row_result.validation_error, number=i, row=row
+                    )
             if (
                 row_result.import_type != RowResult.IMPORT_TYPE_SKIP
                 or self._meta.report_skipped
@@ -987,13 +1027,24 @@ class Resource(metaclass=DeclarativeMetaclass):
     def get_export_fields(self):
         return [self.fields[f] for f in self.get_export_order()]
 
-    def export_resource(self, instance):
-        return [
-            self.export_field(field, instance) for field in self.get_export_fields()
-        ]
+    def export_resource(self, instance, fields=None):
+        export_fields = self.get_export_fields()
 
-    def get_export_headers(self):
+        if isinstance(fields, list) and fields:
+            return [
+                self.export_field(field, instance)
+                for field in export_fields
+                if field.column_name in fields
+            ]
+
+        return [self.export_field(field, instance) for field in export_fields]
+
+    def get_export_headers(self, fields=None):
         headers = [force_str(field.column_name) for field in self.get_export_fields()]
+
+        if isinstance(fields, list) and fields:
+            return [f for f in headers if f in fields]
+
         return headers
 
     def get_user_visible_headers(self):
@@ -1035,11 +1086,12 @@ class Resource(metaclass=DeclarativeMetaclass):
         if queryset is None:
             queryset = self.get_queryset()
         queryset = self.filter_export(queryset, **kwargs)
-        headers = self.get_export_headers()
+        export_fields = kwargs.get("export_fields", None)
+        headers = self.get_export_headers(fields=export_fields)
         dataset = tablib.Dataset(headers=headers)
 
         for obj in self.iter_queryset(queryset):
-            dataset.append(self.export_resource(obj))
+            dataset.append(self.export_resource(obj, fields=export_fields))
 
         self.after_export(queryset, dataset, **kwargs)
 
@@ -1065,8 +1117,15 @@ class Resource(metaclass=DeclarativeMetaclass):
         return kwargs.get("dry_run", False)
 
     def _check_import_id_fields(self, headers):
-        import_id_fields = [self.fields[f] for f in self.get_import_id_fields()]
+        import_id_fields = list()
         missing_fields = list()
+
+        for field_name in self.get_import_id_fields():
+            if field_name not in self.fields:
+                missing_fields.append(field_name)
+            else:
+                import_id_fields.append(self.fields[field_name])
+
         for field in import_id_fields:
             if not headers or field.column_name not in headers:
                 # escape to be safe (exception could end up in logs)
@@ -1074,10 +1133,10 @@ class Resource(metaclass=DeclarativeMetaclass):
                 missing_fields.append(col)
 
         if missing_fields:
-            raise FieldError(
+            raise exceptions.FieldError(
                 _(
-                    "The following import_id_fields are not present in the dataset: %s"
-                    % ", ".join(missing_fields)
+                    "The following fields are declared in 'import_id_fields' but "
+                    "are not present in the resource: %s" % ", ".join(missing_fields)
                 )
             )
 
@@ -1196,9 +1255,17 @@ class ModelResource(Resource, metaclass=ModelDeclarativeMetaclass):
 
         FieldWidget = cls.widget_from_django_field(django_field)
         widget_kwargs = cls.widget_kwargs_for_field(field_name, django_field)
+
+        attribute = field_name
+        column_name = field_name
+        # To solve #974
+        if isinstance(django_field, ForeignKey) and "__" not in column_name:
+            attribute += "_id"
+            widget_kwargs["key_is_id"] = True
+
         field = cls.DEFAULT_RESOURCE_FIELD(
-            attribute=field_name,
-            column_name=field_name,
+            attribute=attribute,
+            column_name=column_name,
             widget=FieldWidget(**widget_kwargs),
             readonly=readonly,
             default=django_field.default,
